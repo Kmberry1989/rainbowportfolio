@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Neon Universe — Memory Fragments</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#000; font-family: Arial, Helvetica, sans-serif; }
+    #hud {
+      position: fixed; left: 12px; bottom: 12px;
+      color: rgba(255,255,255,0.75);
+      font-size: 12px; letter-spacing: 0.04em;
+      user-select: none; pointer-events: none;
+      text-shadow: 0 0 10px rgba(255,255,255,0.5);
+      max-width: 44ch;
+    }
+    #hint {
+      position: fixed; right: 12px; bottom: 12px;
+      color: rgba(255,255,255,0.55);
+      font-size: 12px;
+      user-select:none; pointer-events:none;
+      text-shadow: 0 0 10px rgba(255,255,255,0.35);
+    }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+  <div id="hud">Boot: Oscilloscope online…</div>
+  <div id="hint">Move mouse to drift • Scroll to zoom</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // ---------- Utils ----------
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const lerp = (a,b,t) => a + (b-a)*t;
+
+    function spectrumStops(ctx, x0, y0, x1, y1) {
+      const g = ctx.createLinearGradient(x0,y0,x1,y1);
+      g.addColorStop(0.00, "#b000ff"); // magenta
+      g.addColorStop(0.14, "#8a2be2"); // purple
+      g.addColorStop(0.30, "#2f6bff"); // blue
+      g.addColorStop(0.46, "#00d7ff"); // cyan
+      g.addColorStop(0.52, "#e8ffff"); // white-ish peak
+      g.addColorStop(0.66, "#00ffcc"); // aqua
+      g.addColorStop(0.82, "#53ff2f"); // green
+      g.addColorStop(1.00, "#d8ff00"); // lime/yellow
+      return g;
+    }
+
+    // ---------- Three basics ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 1);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000006, 0.020);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 200);
+    camera.position.set(0, 0.6, 7.5);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.enablePan = false;
+    controls.minDistance = 3.5;
+    controls.maxDistance = 14;
+    controls.target.set(0, 0.2, 0);
+
+    const hud = document.getElementById("hud");
+
+    // ---------- Lighting (neon-friendly) ----------
+    const ambient = new THREE.AmbientLight(0xffffff, 0.30);
+    scene.add(ambient);
+
+    const key = new THREE.PointLight(0x66ffff, 1.2, 30, 2);
+    key.position.set(-3, 2, 6);
+    scene.add(key);
+
+    const rim = new THREE.PointLight(0x9b00ff, 0.9, 30, 2);
+    rim.position.set(4, -1, 5);
+    scene.add(rim);
+
+    // ---------- Starfield (Points) ----------
+    function makeStarfield(count = 5500) {
+      const geo = new THREE.BufferGeometry();
+      const pos = new Float32Array(count * 3);
+      const col = new Float32Array(count * 3);
+
+      for (let i = 0; i < count; i++) {
+        // A loose “galaxy cloud” volume
+        const r = Math.pow(Math.random(), 0.35) * 55;
+        const th = Math.random() * Math.PI * 2;
+        const ph = (Math.random() - 0.5) * 0.9;
+
+        const x = Math.cos(th) * r;
+        const y = ph * r * 0.18 + (Math.random()-0.5)*2;
+        const z = Math.sin(th) * r;
+
+        pos[i*3+0] = x;
+        pos[i*3+1] = y;
+        pos[i*3+2] = z;
+
+        const a = 0.6 + Math.random() * 0.4;
+        col[i*3+0] = a;
+        col[i*3+1] = a;
+        col[i*3+2] = a;
+      }
+
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+
+      const mat = new THREE.PointsMaterial({
+        size: 0.055,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false
+      });
+
+      const pts = new THREE.Points(geo, mat);
+      return pts;
+    }
+
+    const stars = makeStarfield();
+    scene.add(stars);
+
+    // ---------- Oscilloscope texture (canvas -> texture) ----------
+    const oscW = 1024, oscH = 512;
+    const oscCanvas = document.createElement("canvas");
+    oscCanvas.width = oscW; oscCanvas.height = oscH;
+    const octx = oscCanvas.getContext("2d");
+
+    const oscTex = new THREE.CanvasTexture(oscCanvas);
+    oscTex.minFilter = THREE.LinearFilter;
+    oscTex.magFilter = THREE.LinearFilter;
+
+    function drawOscilloscope(timeMs) {
+      const t = timeMs * 0.001;
+
+      // background
+      octx.clearRect(0,0,oscW,oscH);
+      octx.fillStyle = "#050508";
+      octx.fillRect(0,0,oscW,oscH);
+
+      // vignette
+      const vg = octx.createRadialGradient(oscW*0.5, oscH*0.5, 10, oscW*0.5, oscH*0.5, oscW*0.7);
+      vg.addColorStop(0, "rgba(8,10,14,0.4)");
+      vg.addColorStop(1, "rgba(0,0,0,0.9)");
+      octx.fillStyle = vg;
+      octx.fillRect(0,0,oscW,oscH);
+
+      // grid
+      octx.lineWidth = 1;
+      octx.strokeStyle = "rgba(255,255,255,0.10)";
+      const gx = 34, gy = 34;
+      for (let x=0; x<=oscW; x+=gx) { octx.beginPath(); octx.moveTo(x,0); octx.lineTo(x,oscH); octx.stroke(); }
+      for (let y=0; y<=oscH; y+=gy) { octx.beginPath(); octx.moveTo(0,y); octx.lineTo(oscW,y); octx.stroke(); }
+
+      // baseline
+      const midY = oscH * 0.52;
+      octx.strokeStyle = "rgba(255,255,255,0.14)";
+      octx.lineWidth = 2;
+      octx.beginPath();
+      octx.moveTo(0, midY);
+      octx.lineTo(oscW, midY);
+      octx.stroke();
+
+      // moving pulse center
+      const cycle = (t * 0.18) % 1;
+      const pulseCenter = oscW * cycle;
+
+      // waveform points
+      const pts = [];
+      const step = 6;
+      for (let x=0; x<=oscW; x+=step) {
+        const dx = (x - pulseCenter) / (oscW * 0.08);
+        const spike = Math.exp(-dx*dx*8) * (dx < 0 ? 0.4 : 1.0);
+        const wave  = Math.sin(dx * 12) * Math.exp(-Math.abs(dx) * 2.2);
+        const ring  = Math.sin(dx * 24) * Math.exp(-Math.abs(dx) * 4.5);
+        const y = midY - (spike * 170 + wave * 42 + ring * 12);
+        pts.push([x,y]);
+      }
+
+      const fade = 0.55 + 0.45*Math.sin(t*1.2);
+
+      // gradient stroke
+      const grad = spectrumStops(octx, 0, midY, oscW, midY);
+      octx.lineJoin = "round";
+      octx.lineCap = "round";
+
+      // glow layers
+      octx.globalAlpha = 0.10 * fade;
+      octx.strokeStyle = grad;
+      octx.lineWidth = 18;
+      octx.beginPath();
+      pts.forEach(([x,y],i)=> i?octx.lineTo(x,y):octx.moveTo(x,y));
+      octx.stroke();
+
+      octx.globalAlpha = 0.20 * fade;
+      octx.lineWidth = 10;
+      octx.beginPath();
+      pts.forEach(([x,y],i)=> i?octx.lineTo(x,y):octx.moveTo(x,y));
+      octx.stroke();
+
+      // crisp core
+      octx.globalAlpha = 0.95 * fade;
+      octx.lineWidth = 4;
+      octx.beginPath();
+      pts.forEach(([x,y],i)=> i?octx.lineTo(x,y):octx.moveTo(x,y));
+      octx.stroke();
+
+      // sparks
+      octx.globalAlpha = 1;
+      for (let i=0;i<65;i++){
+        const sx = Math.random()*oscW;
+        const sy = Math.random()*oscH;
+        const near = Math.abs(sy-midY) < 90 ? 1 : 0;
+        if (!near) continue;
+        const a = 0.05 + Math.random()*0.22;
+        octx.fillStyle = `rgba(255,255,255,${a})`;
+        octx.fillRect(sx, sy, 1+Math.random()*2, 1+Math.random()*2);
+      }
+
+      octx.globalAlpha = 1;
+      oscTex.needsUpdate = true;
+    }
+
+    // ---------- Central screen plane + neon frame ----------
+    const screenGroup = new THREE.Group();
+    scene.add(screenGroup);
+
+    const screenW = 6.8;
+    const screenH = 3.2;
+
+    const screenMat = new THREE.MeshBasicMaterial({
+      map: oscTex,
+      transparent: true
+    });
+
+    const screenPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(screenW, screenH, 1, 1),
+      screenMat
+    );
+    screenPlane.position.set(0, 0.2, 0);
+    screenGroup.add(screenPlane);
+
+    // Outer frame (emissive rainbow)
+    const frameGeo = new THREE.RingGeometry(0.0, 1.0, 64); // reused for “gears”
+    function makeGlowBar(w, h, z, y) {
+      const geo = new THREE.PlaneGeometry(w, h);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: 0xffffff,
+        emissiveIntensity: 1.2,
+        transparent: true,
+        opacity: 0.18,
+        metalness: 0.0,
+        roughness: 0.2
+      });
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set(0, y, z);
+      return m;
+    }
+
+    // A subtle “aura” plane behind the screen
+    const aura = makeGlowBar(screenW*1.1, screenH*1.1, -0.08, 0.2);
+    screenGroup.add(aura);
+
+    // Frame outline as a line loop with vertex colors (rainbow)
+    function makeRainbowFrameLine(w, h) {
+      const pts = [];
+      const r = 0.22;
+      const seg = 36;
+
+      // rounded-rect param
+      for (let i=0;i<=seg;i++){
+        const t = i/seg;
+        const x = lerp(-w/2 + r, w/2 - r, t);
+        pts.push(new THREE.Vector3(x, h/2, 0));
+      }
+      for (let i=0;i<=seg;i++){
+        const t = i/seg;
+        const y = lerp(h/2 - r, -h/2 + r, t);
+        pts.push(new THREE.Vector3(w/2, y, 0));
+      }
+      for (let i=0;i<=seg;i++){
+        const t = i/seg;
+        const x = lerp(w/2 - r, -w/2 + r, t);
+        pts.push(new THREE.Vector3(x, -h/2, 0));
+      }
+      for (let i=0;i<=seg;i++){
+        const t = i/seg;
+        const y = lerp(-h/2 + r, h/2 - r, t);
+        pts.push(new THREE.Vector3(-w/2, y, 0));
+      }
+
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const colors = new Float32Array(pts.length * 3);
+
+      for (let i=0;i<pts.length;i++){
+        const u = i/(pts.length-1);
+        const c = new THREE.Color().setHSL(0.78 - u*0.78, 1.0, 0.55); // purple -> red-ish -> green-ish range
+        colors[i*3+0] = c.r;
+        colors[i*3+1] = c.g;
+        colors[i*3+2] = c.b;
+      }
+      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+      const mat = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.95
+      });
+
+      const line = new THREE.LineLoop(geo, mat);
+      line.position.set(0, 0.2, 0.06);
+      return line;
+    }
+
+    const frameLine = makeRainbowFrameLine(screenW*1.06, screenH*1.10);
+    screenGroup.add(frameLine);
+
+    // “Gears” around the frame
+    function makeGear(x, y, scale, hue) {
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: new THREE.Color().setHSL(hue, 1.0, 0.6),
+        emissiveIntensity: 2.0,
+        metalness: 0.0,
+        roughness: 0.25,
+        transparent: true,
+        opacity: 0.9
+      });
+      const m = new THREE.Mesh(frameGeo, mat);
+      m.scale.setScalar(scale);
+      m.position.set(x, y, 0.08);
+      return m;
+    }
+
+    const gears = [];
+    gears.push(makeGear(-screenW*0.62, 0.2 + screenH*0.45, 0.14, 0.78));
+    gears.push(makeGear(-screenW*0.62, 0.2 - screenH*0.45, 0.11, 0.66));
+    gears.push(makeGear( screenW*0.62, 0.2 + screenH*0.45, 0.12, 0.32));
+    gears.push(makeGear( screenW*0.62, 0.2 - screenH*0.45, 0.16, 0.22));
+    gears.forEach(g => screenGroup.add(g));
+
+    // ---------- Memory fragments (billboards) ----------
+    // Each fragment is a small “scene” rendered to a canvas texture (placeholder),
+    // later you can replace with real images/video frames and keep the same behavior.
+    function makeMemoryTexture(seed, label) {
+      const c = document.createElement("canvas");
+      c.width = 512; c.height = 512;
+      const g = c.getContext("2d");
+
+      // dark base
+      g.fillStyle = "#020206";
+      g.fillRect(0,0,c.width,c.height);
+
+      // neon mist
+      const cx = 260 + Math.sin(seed)*90;
+      const cy = 250 + Math.cos(seed*1.7)*90;
+      const rad = 300;
+      const neb = g.createRadialGradient(cx, cy, 20, cx, cy, rad);
+      neb.addColorStop(0, "rgba(0,255,220,0.20)");
+      neb.addColorStop(0.35, "rgba(180,0,255,0.14)");
+      neb.addColorStop(0.75, "rgba(0,120,255,0.10)");
+      neb.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = neb;
+      g.fillRect(0,0,c.width,c.height);
+
+      // abstract silhouettes (memory shards)
+      g.globalAlpha = 0.9;
+      for (let i=0;i<18;i++){
+        const x = (Math.random()*0.9+0.05)*c.width;
+        const y = (Math.random()*0.9+0.05)*c.height;
+        const w = 20 + Math.random()*140;
+        const h = 10 + Math.random()*90;
+        const ang = (Math.random()-0.5)*0.6;
+        g.save();
+        g.translate(x,y);
+        g.rotate(ang);
+        const grad = spectrumStops(g, -w/2, 0, w/2, 0);
+        g.fillStyle = grad;
+        g.shadowBlur = 18;
+        g.shadowColor = "rgba(120,255,255,0.8)";
+        g.fillRect(-w/2,-h/2,w,h);
+        g.restore();
+      }
+
+      // thin grid hint
+      g.globalAlpha = 0.14;
+      g.strokeStyle = "rgba(255,255,255,0.35)";
+      for (let i=0;i<9;i++){
+        const yy = (i/8)*c.height;
+        g.beginPath(); g.moveTo(0,yy); g.lineTo(c.width,yy); g.stroke();
+      }
+
+      // label
+      g.globalAlpha = 0.85;
+      g.fillStyle = "rgba(255,255,255,0.9)";
+      g.font = "18px Arial";
+      g.textAlign = "left";
+      g.fillText(label, 18, c.height - 20);
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      return tex;
+    }
+
+    const fragments = [];
+    const fragmentGroup = new THREE.Group();
+    scene.add(fragmentGroup);
+
+    function addFragment(label, pos, seed) {
+      const tex = makeMemoryTexture(seed, label);
+
+      const mat = new THREE.MeshStandardMaterial({
+        map: tex,
+        transparent: true,
+        opacity: 0.0,
+        emissive: new THREE.Color(0xffffff),
+        emissiveIntensity: 0.45,
+        roughness: 0.35,
+        metalness: 0.0,
+        side: THREE.DoubleSide
+      });
+
+      const w = 1.6, h = 1.6;
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w,h), mat);
+      mesh.position.copy(pos);
+      mesh.userData.label = label;
+      mesh.userData.baseScale = 1.0;
+      mesh.userData.fade = 0.0;
+
+      // glow outline
+      const outline = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.PlaneGeometry(w,h)),
+        new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.0 })
+      );
+      outline.position.copy(pos);
+      mesh.userData.outline = outline;
+
+      fragmentGroup.add(mesh);
+      fragmentGroup.add(outline);
+
+      fragments.push(mesh);
+    }
+
+    // Place memories in a loose “constellation” corridor
+    addFragment("Memory: Neon hallway",  new THREE.Vector3(-3.5,  1.0, -10),  1.2);
+    addFragment("Memory: Rain on glass", new THREE.Vector3( 2.4, -0.4, -12),  2.1);
+    addFragment("Memory: Warm kitchen",  new THREE.Vector3(-1.0, -1.2, -16),  3.0);
+    addFragment("Memory: Gallery lights",new THREE.Vector3( 3.8,  0.8, -18),  4.4);
+    addFragment("Memory: Blue night drive",new THREE.Vector3( 0.2,  1.6, -22), 5.7);
+
+    // ---------- Cursor drift / approach logic ----------
+    const pointer = new THREE.Vector2(0, 0);
+    const raycaster = new THREE.Raycaster();
+
+    let driftX = 0, driftY = 0;
+    let hoverLabel = null;
+
+    window.addEventListener("pointermove", (e) => {
+      pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+      pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
+      driftX = pointer.x;
+      driftY = pointer.y;
+    });
+
+    // ---------- Boot -> Explore transition ----------
+    let boot = 1.0; // 1 means oscilloscope front-and-center, 0 means it becomes “just another portal”
+    function updateBoot(dt) {
+      // After a few seconds, slowly fade boot away
+      const target = 0.0;
+      boot = lerp(boot, target, 1 - Math.exp(-dt * 0.18));
+    }
+
+    // ---------- Animate ----------
+    let last = performance.now();
+
+    function animate(now) {
+      const dt = (now - last) / 1000;
+      last = now;
+
+      // background star drift (subtle)
+      stars.rotation.y += dt * 0.008;
+      stars.rotation.x += dt * 0.004;
+
+      // camera drift toward pointer (gentle “navigation” feel)
+      const driftStrength = 0.55;
+      camera.position.x = lerp(camera.position.x, driftX * driftStrength, 1 - Math.exp(-dt * 1.4));
+      camera.position.y = lerp(camera.position.y, 0.6 + driftY * driftStrength * 0.4, 1 - Math.exp(-dt * 1.2));
+
+      // boot transition
+      updateBoot(dt);
+      screenGroup.position.z = lerp(screenGroup.position.z, boot * 0 + (1-boot) * (-2.2), 1 - Math.exp(-dt * 1.2));
+      screenGroup.rotation.y = lerp(screenGroup.rotation.y, (1-boot) * (-0.18), 1 - Math.exp(-dt * 1.0));
+      screenGroup.rotation.x = lerp(screenGroup.rotation.x, (1-boot) * (0.06), 1 - Math.exp(-dt * 1.0));
+
+      // gears rotate
+      gears.forEach((g,i)=> g.rotation.z += dt * (0.6 + i*0.15));
+
+      // update oscilloscope texture (still alive even after boot)
+      drawOscilloscope(now);
+
+      // billboard fragments face camera
+      fragments.forEach(m => m.lookAt(camera.position));
+      fragments.forEach(m => m.userData.outline.lookAt(camera.position));
+
+      // Raycast hover detection (for label)
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(fragments, false);
+      hoverLabel = hits.length ? hits[0].object.userData.label : null;
+
+      // Fade in fragments based on distance to camera (approach = reveal)
+      let nearest = null;
+      let nearestD = Infinity;
+
+      for (const m of fragments) {
+        const d = m.position.distanceTo(camera.position);
+        nearestD = Math.min(nearestD, d);
+        if (d < nearestD) nearest = m;
+
+        // reveal window
+        const reveal = clamp01(1 - (d - 4.5) / 7.5); // within ~12 units
+        const hoverBoost = (hoverLabel === m.userData.label) ? 0.25 : 0.0;
+
+        m.userData.fade = lerp(m.userData.fade, clamp01(reveal + hoverBoost), 1 - Math.exp(-dt * 6.0));
+        m.material.opacity = 0.05 + 0.95 * m.userData.fade;
+        m.material.emissiveIntensity = 0.25 + 0.85 * m.userData.fade;
+
+        const s = 1.0 + 0.12 * m.userData.fade + (hoverBoost * 0.22);
+        m.scale.setScalar(s);
+
+        // outline glow
+        const o = m.userData.outline;
+        o.material.opacity = 0.05 + 0.75 * m.userData.fade;
+      }
+
+      // HUD text behavior
+      if (boot > 0.25) {
+        hud.textContent = "Boot: Oscilloscope online…";
+      } else if (hoverLabel) {
+        hud.textContent = `${hoverLabel} — drift closer to “enter”`;
+      } else {
+        hud.textContent = "Explore: drift through the neon void • fragments awaken as you approach";
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    requestAnimationFrame(animate);
+
+    // ---------- Resize ----------
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
